@@ -1,5 +1,6 @@
 //
 // Copyright © 2013 Dirk-Willem van Gulik <dirkx@webweaving.org>, all rights reserved.
+// Copyright © 2016 Adam Augustyn <adam@augustyn.net>, all rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
 //
@@ -37,36 +38,67 @@ void iso7816AnalyzerResults::GenerateBubbleText( U64 frame_index, Channel& chann
 }
 #endif
 
-void iso7816AnalyzerResults::GenerateBubbleText( U64 frame_index, Channel& /*channel*/, DisplayBase display_base )  //unrefereced vars commented out to remove warnings.
+void iso7816AnalyzerResults::GenerateBubbleText(U64 frame_index, Channel& channel, DisplayBase display_base)  //unrefereced vars commented out to remove warnings.
 {
 	char number_str[128];
-        //we only need to pay attention to 'channel' if we're making bubbles for more than one channel (as set by AddChannelBubblesWillAppearOn)
-        ClearResultStrings();
-        Frame frame = GetFrame( frame_index );
+    //we only need to pay attention to 'channel' if we're making bubbles for more than one channel (as set by AddChannelBubblesWillAppearOn)
+    ClearResultStrings();
+    Frame frame = GetFrame(frame_index);
 
-        //enum UnioFrameType { HeaderFrame, AddressFrame8, AddressFrame12, DataFrame, InvalidBit, ErrorMakRequired, ErrorNoSakRequired };
-        switch( frame.mFlags )
-        {
-                case 0:
-			AnalyzerHelpers::GetNumberString( frame.mData1, display_base, 8, number_str, sizeof(number_str));
-			AddResultString( number_str );
+	if (channel == mSettings->mResetChannel)
+	{
+		switch (frame.mFlags)
+		{
+		case ATR:
+			AddResultString("A");
+			AddResultString("ATR");
+			AddResultString("ATR");
 			break;
-                case INVERSE:
-                        AddResultString( "I" );
-                        AddResultString( "INV" );
-                        AddResultString( "Hdr(INVERSE)" );
-                        break;
-                case DIRECT:
-                        AddResultString( "D" );
-                        AddResultString( "DIR" );
-                        AddResultString( "Hdr(DIRECT)" );
-                        break;
-                default:
-                        AddResultString( "?" );
-			AnalyzerHelpers::GetNumberString( frame.mFlags, display_base, 8, number_str, sizeof(number_str));
-			AddResultString( number_str );
-                        break;
-        }
+
+		case PPS:
+			AddResultString("P");
+			AddResultString("PPS");
+			AddResultString("PPS: ", ((iso7816Analyzer*)mAnalyzer)->GetDetails(static_cast<int>(frame.mData1)).c_str());
+			break;
+
+		default:
+			break;
+		}
+	}
+	else
+	{
+		switch (frame.mFlags)
+		{
+		case 0:
+			AnalyzerHelpers::GetNumberString(frame.mData1, display_base, 8, number_str, sizeof(number_str));
+			AddResultString(number_str);
+			break;
+
+		case INVERSE:
+			AddResultString("I");
+			AddResultString("INV");
+			AddResultString("Hdr(INVERSE)");
+			break;
+
+		case DIRECT:
+			AddResultString("D");
+			AddResultString("DIR");
+			AddResultString("Hdr(DIRECT)");
+			break;
+
+		case ATR:
+			break;
+
+		case PPS:
+			break;
+
+		default:
+			AddResultString("?");
+			AnalyzerHelpers::GetNumberString(frame.mFlags, display_base, 8, number_str, sizeof(number_str));
+			AddResultString(number_str);
+			break;
+		}
+	}
 }
 
 void iso7816AnalyzerResults::GenerateExportFile( const char* file, DisplayBase display_base, U32 export_type_user_id )
