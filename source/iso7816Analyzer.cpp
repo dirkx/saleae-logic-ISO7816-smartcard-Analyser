@@ -1,5 +1,6 @@
 //
 // Copyright © 2013 Dirk-Willem van Gulik <dirkx@webweaving.org>, all rights reserved.
+// Copyright © 2016 Adam Augustyn <adam@augustyn.net>, all rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
 //
@@ -15,9 +16,11 @@
 #include <AnalyzerChannelData.h>
 #include <AnalyzerHelpers.h>
 #include <AnalyzerResults.h>
-
-#include <iostream>
-#include <sstream>
+#include "Logging.hpp"
+#include "Convert.hpp"
+#include "SaleaeHelper.hpp"
+#include "Definitions.hpp"
+#include "ISO7816Pps.hpp"
 
 static const unsigned char msb2lsb[] = 
 {
@@ -48,7 +51,7 @@ static const bool parity[256] =
 };
 
 iso7816Analyzer::iso7816Analyzer()
-:	Analyzer(),  
+:	Analyzer2(),  
 	mSettings( new iso7816AnalyzerSettings() ),
 	mSimulationInitilized( false )
 {
@@ -62,16 +65,42 @@ iso7816Analyzer::~iso7816Analyzer()
 
 void iso7816Analyzer::WorkerThread()
 {
+	try
+	{
+		Logging::Write("Start");
+		_WorkerThread();
+		Logging::Write("Stop");
+	}
+	catch (std::exception &e)
+	{
+		Logging::Write(std::string("[Exception] ") + e.what());
+	}
+	catch (...)
+	{
+		Logging::Write("[Exception] Unknown error");
+	}
+}
+
+void iso7816Analyzer::SetupResults()
+{
+	mResults.reset(new iso7816AnalyzerResults(this, mSettings.get()));
+	SetAnalyzerResults(mResults.get());
+	mResults->AddChannelBubblesWillAppearOn(mSettings->mIoChannel);
+	mResults->AddChannelBubblesWillAppearOn(mSettings->mResetChannel);
+
+	Logging::Write(std::string("SimulationSampleRate: ") + Convert::ToDec(GetSimulationSampleRate()));
+	Logging::Write(std::string("SampleRate: ") + Convert::ToDec(GetSampleRate()));
+	Logging::Write(std::string("TriggerSample: ") + Convert::ToDec(GetTriggerSample()));
+}
+
+void iso7816Analyzer::_WorkerThread()
+{
 	iso7816_mode_t mode;
 
-	mResults.reset( new iso7816AnalyzerResults( this, mSettings.get() ) );
-	SetAnalyzerResults( mResults.get() );
-
-	mResults->AddChannelBubblesWillAppearOn( mSettings->mIoChannel );
-	// mResults->AddChannelBubblesWillAppearOn( mSettings->mResetChannel );
-
 	mIo = GetAnalyzerChannelData( mSettings->mIoChannel );
-	mReset= GetAnalyzerChannelData( mSettings->mResetChannel );
+	mReset = GetAnalyzerChannelData( mSettings->mResetChannel );
+	mVcc = GetAnalyzerChannelData(mSettings->mVccChannel);
+	mClk = GetAnalyzerChannelData(mSettings->mClkChannel);
 
 	for( ; ; ) {
 		// seek for a RESET going high.
@@ -82,8 +111,9 @@ void iso7816Analyzer::WorkerThread()
 			continue;
 
 		// discard all serial data until now.
-		//
-		mIo->AdvanceToAbsPosition( mReset->GetSampleNumber() );
+		U64 reset = mReset->GetSampleNumber();
+		Logging::Write(std::string("Reset detected: ") + Convert::ToDec(reset));
+		mIo->AdvanceToAbsPosition(reset);		
 
 		// mark the start in pretty much all channels.
 		//
@@ -101,57 +131,96 @@ void iso7816Analyzer::WorkerThread()
 		//
 		// search for first stop bit.
 		//
-		while(mIo->GetBitState() != BIT_HIGH)
+
+		U64 etu = 0;
+		U64 a0 = 0;
+		while (true)
+		{
+			mClk->AdvanceToAbsPosition(mIo->GetSampleNumber());
+			U64 startBit = SaleaeHelper::AdvanceClkCycles(mClk, 400);
+			Logging::Write(std::string("Start bit seeking: ") + Convert::ToDec(startBit));
+			mIo->AdvanceToAbsPosition(startBit);
+			mResults->AddMarker(reset, AnalyzerResults::UpArrow, mSettings->mResetChannel);
+
+			// seeking for falling edge
+			while (mIo->GetBitState() != BIT_HIGH)
+			{
+				mIo->AdvanceToNextEdge();
+			}
+
 			mIo->AdvanceToNextEdge();
+			a0 = mIo->GetSampleNumber();
+			mIo->AdvanceToNextEdge();
+			U64 a1 = mIo->GetSampleNumber();
 
-		mIo->AdvanceToNextEdge();
-	
-		U64 a0 = mIo->GetSampleNumber();
-		mIo->AdvanceToNextEdge();
+			mClk->AdvanceToAbsPosition(a0);
+			U64 clocks = mClk->AdvanceToAbsPosition(a1) / 2;
 
-		U64 a1 = mIo->GetSampleNumber();
-		U64 ea = (a1 - a0);
+			// default ETU shoud be 372 
+			if (!IsValidETU(clocks))
+			{
+				Logging::Write(std::string("This is not a valid start bit: ") + Convert::ToDec(clocks) + std::string(" clocks..."));
+				mIo->AdvanceToNextEdge();
+				continue;
+			}
+			etu = clocks;
+
+			mResults->AddMarker(a0, AnalyzerResults::DownArrow, mSettings->mIoChannel);
+			mResults->AddMarker(a0 + (a1 - a0) / 2, AnalyzerResults::Start, mSettings->mIoChannel);
+			mResults->AddMarker(a1, AnalyzerResults::UpArrow, mSettings->mIoChannel);
+			Logging::Write(std::string("Found the start bit, initial ETU: ") + Convert::ToDec(clocks) + std::string(" clocks..."));
+			break;
+		}
+
+		if (!IsValidETU(etu))
+		{
+			Logging::Write("Valid start bit not found, skipinng analysis...");
+			mIo->AdvanceToNextEdge();
+			continue;
+		}
 
 		if (mIo->GetBitState() != BIT_HIGH) {
 			mResults->AddMarker(mIo->GetSampleNumber(), AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 			mResults->CommitResults();
-			printf("Start bit end error\n");
+			Logging::Write("Start bit end error");
 			continue;
 		}
 
-		mResults->AddMarker(a0, AnalyzerResults::DownArrow, mSettings->mIoChannel);
-		mResults->AddMarker(a0+ea/2, AnalyzerResults::Start, mSettings->mIoChannel);
-		mResults->AddMarker(a1, AnalyzerResults::UpArrow, mSettings->mIoChannel);
 
 		U16 data = 0; 
 
-		for(U32 i = 0; i <= 8; i++) {
+		// move to the center of first data bit
+		U64 bitPos = SaleaeHelper::AdvanceClkCycles(mClk, etu / 2);
+		U64 pausePos = 0;
+		for (U32 i = 0; i <= 8; i++) {
 			// move to the center of what we're guessing as best as we can
-			mIo->AdvanceToAbsPosition(a1 + ea * (0.5 + i));
+			mIo->AdvanceToAbsPosition(bitPos);
 			U8 bit = mIo->GetBitState() ? 1 : 0;
-
 			mResults->AddMarker(mIo->GetSampleNumber(), bit ? AnalyzerResults::One : AnalyzerResults::Zero, mSettings->mIoChannel);
-
 			data = (data <<1) | bit;
+			if (i == 8)
+			{
+				pausePos = SaleaeHelper::AdvanceClkCycles(mClk, etu);
+			}
+			else
+			{
+				bitPos = SaleaeHelper::AdvanceClkCycles(mClk, etu);
+			}
 		};
-		U8 p = data  & 1;
+		bool p = 1 == (data & 1);
 		data >>= 1;
 
-		if (parity[ data ] != p) {
-			mResults->AddMarker(
-				a1 + ea * (0.5 + 9), AnalyzerResults::ErrorDot, mSettings->mIoChannel
-			);
+		if (parity[data] != p) {
+			mResults->AddMarker(bitPos, AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 			mResults->CommitResults();
-			printf("Parity error\n");
+			Logging::Write("Parity error");
 			continue;
 		};
 		
-		mResults->AddMarker(a1 + ea * (0.5 + 9), AnalyzerResults::Stop, mSettings->mIoChannel);
+		mResults->AddMarker(bitPos, AnalyzerResults::Stop, mSettings->mIoChannel);
 		if (mIo->GetBitState() != BIT_HIGH) {
-			printf("Stop bit not high.");
-			mResults->AddMarker(
-				a1 + ea * 10, AnalyzerResults::ErrorDot, mSettings->mIoChannel
-			);
+			Logging::Write("Stop bit not high.");
+			mResults->AddMarker(pausePos, AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 			mResults->CommitResults();
 			continue;
 		};
@@ -159,18 +228,20 @@ void iso7816Analyzer::WorkerThread()
 		switch(data & 0xFF) {
 		case 0xC0:
 			mode = INVERSE;
-			printf("Inverse mode msb first trransmitted\n");
+			Logging::Write("Inverse mode msb first trransmitted");
 			break;
 		case 0xDC:
 			mode = DIRECT;
-			printf("Direct mode lsb first transmitted\n");
+			Logging::Write("Direct mode lsb first transmitted");
 			break;
 		default:
-			printf("unk mode %x\n", data);
-			mResults->AddMarker(mIo->GetSampleNumber(),
-				AnalyzerResults::ErrorDot, mSettings->mIoChannel);
-			mResults->CommitResults();
-			continue;
+			{
+				Logging::Write(std::string("Unknown mode: ") + Convert::ToHex(data));
+				mResults->AddMarker(mIo->GetSampleNumber(),
+					AnalyzerResults::ErrorDot, mSettings->mIoChannel);
+				mResults->CommitResults();
+				continue;
+			}
 		}
 
 		if (mode == INVERSE) {
@@ -183,6 +254,20 @@ void iso7816Analyzer::WorkerThread()
             if (data != 0x3B)
                 AnalyzerHelpers::Assert("Internal calculation issue or something similarly odd. Expected 0x3B for DIRECT mode.");
 		};
+
+		ppsFound = false;
+		details.clear();
+		{
+			Frame frame;
+			frame.mData1 = 0;
+			frame.mFlags = ATR;
+			frame.mStartingSampleInclusive = reset;
+			frame.mEndingSampleInclusive = mIo->GetSampleNumber();
+
+			mResults->AddFrame(frame);
+			mResults->CommitResults();
+		}
+
 		{
 			Frame frame;
 			frame.mData1 = 0;
@@ -202,19 +287,23 @@ void iso7816Analyzer::WorkerThread()
 				mResults->AddMarker(mIo->GetSampleNumber(),
 					AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 				mResults->CommitResults();
-				printf("Out of sync with start bit.\n");
-				break;
+				Logging::Write(std::string("Out of sync with start bit."));
+				continue;
 			};
 
 			U64 starting_sample = mIo->GetSampleNumber();
-			
-			mIo->Advance( (U32)(ea / 2));
+			// synchronise CLK position
+			mClk->AdvanceToAbsPosition(starting_sample);
+
+			U64 bitPos = SaleaeHelper::AdvanceClkCycles(mClk, etu / 2);
+			mIo->AdvanceToAbsPosition(bitPos);
 			mResults->AddMarker(mIo->GetSampleNumber(), AnalyzerResults::Start, mSettings->mIoChannel);
 
 			U16 data = 0; 
-
 			for(U32 i = 0; i <= 8; i++) {
-				mIo->Advance((U32)ea);
+
+				bitPos = SaleaeHelper::AdvanceClkCycles(mClk, etu);
+				mIo->AdvanceToAbsPosition(bitPos);
 
 				U8 bit = mIo->GetBitState() ? 1 : 0;
 				mResults->AddMarker(mIo->GetSampleNumber(), bit ? AnalyzerResults::One : AnalyzerResults::Zero, mSettings->mIoChannel);
@@ -222,35 +311,34 @@ void iso7816Analyzer::WorkerThread()
 				data = (data <<1) | bit;
 			};
 
-			U8 p = data  & 1;
+			bool p = 1 == (data  & 1);
 			data >>= 1;
 
 			if (parity[ data ] != p) {
-				mResults->AddMarker(
-					mIo->GetSampleNumber(),AnalyzerResults::ErrorDot, mSettings->mIoChannel
-				);
+				mResults->AddMarker(mIo->GetSampleNumber(),AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 				mResults->CommitResults();
-				printf("Parity error\n");
+				Logging::Write(std::string("Parity error"));
 				break;
 			};
 
-			mIo->Advance((U32)ea);
+			bitPos = SaleaeHelper::AdvanceClkCycles(mClk, etu);
+			mIo->AdvanceToAbsPosition(bitPos);
 			if (mIo->GetBitState() != BIT_HIGH) {
-				printf("Stop bit not high.");
-				mResults->AddMarker(
-					mIo->GetSampleNumber(), AnalyzerResults::ErrorDot, mSettings->mIoChannel
-				);
+				Logging::Write(std::string("Stop bit not high."));
+				mResults->AddMarker(mIo->GetSampleNumber(), AnalyzerResults::ErrorDot, mSettings->mIoChannel);
 				mResults->CommitResults();
 				break;
 			};
 
 			mResults->AddMarker(mIo->GetSampleNumber(), AnalyzerResults::Stop, mSettings->mIoChannel);
 
-	                if (mode == INVERSE) 
-	       	                 data = (!data) & 0xFF;
+	        if (mode == INVERSE) 
+				data = static_cast<unsigned char>(!data) & 0xFF;
 			else 
-                        	data = msb2lsb[data & 0xFF];
+				data = msb2lsb[data & 0xFF];
 		
+			Logging::Write(std::string("data: ") + Convert::ToHex((unsigned char)data));
+
 			Frame frame;
 			frame.mData1 = data;
 			frame.mFlags = 0;
@@ -260,8 +348,97 @@ void iso7816Analyzer::WorkerThread()
 			mResults->AddFrame( frame );
 			mResults->CommitResults();
 			ReportProgress( frame.mEndingSampleInclusive );
+
+
+			size_t exchLen = 0;
+			ISO7816Pps::ptr ppsData = SeekPPS(starting_sample, mIo->GetSampleNumber(), data, exchLen);
+			if (ppsData)
+			{
+				Logging::Write(std::string("The new ETU value is: ") + Convert::ToDec(ppsData->GetEtu()));
+				Logging::Write(std::string("PPS Exchange length is: ") + Convert::ToDec(exchLen) + std::string(" bytes"));
+				etu = static_cast<U64>(ppsData->GetEtu());
+
+				{
+					details.push_back(ppsData->ToString());
+					Frame frame;
+					frame.mData1 = details.size() - 1;
+					frame.mFlags = PPS;
+					frame.mStartingSampleInclusive = pps[0].GetStartPos();
+					frame.mEndingSampleInclusive = pps[exchLen - 1].GetEndPos();
+
+					mResults->AddFrame(frame);
+					mResults->CommitResults();
+				}
+				pps.clear();
+			}
 		}
 	}
+}
+
+bool iso7816Analyzer::IsValidETU(U64 ea)
+{
+	return ea > DEF_ETU_MIN && ea < DEF_ETU_MAX;
+}
+
+ISO7816Pps::ptr iso7816Analyzer::SeekPPS(U64 startPos, U64 endPos, U16 data, size_t& exchLen)
+{
+	if (ppsFound) return ISO7816Pps::ptr();
+
+	pps.push_back(ByteElement(static_cast<unsigned char>(data), startPos, endPos));
+	if (pps.size() >= 8 && pps[0].GetValue() != 0xff && pps[4].GetValue() != 0xff)
+	{
+		pps.erase(pps.begin());
+	}
+	if (pps[0].GetValue() != 0xff)
+	{
+		pps.erase(pps.begin());
+	}
+
+	//std::string tmp;
+	//for (std::vector<unsigned char>::iterator iter = pps.begin(); iter != pps.end(); iter++)
+	//{
+	//	tmp += Convert::ToHex((unsigned char)*iter);
+	//}
+	//if (!tmp.empty())
+	//{
+	//	Logging::Write(tmp);
+	//}
+
+	int res = ISO7816Pps::IsPpsFrame(pps.ToBytes(), 0);
+	//Logging::Write(std::string("ISO7816Pps::IsPpsFrame: ") + Convert::ToDec(res));
+	if (res > 0)
+	{
+		ISO7816Pps::ptr frm1 = ISO7816Pps::DecodeFrame(pps.ToBytes(), 0);
+		int res2 = ISO7816Pps::IsPpsFrame(pps.ToBytes(), res);
+		if (res2 > 0)
+		{
+			ISO7816Pps::ptr frm2 = ISO7816Pps::DecodeFrame(pps.ToBytes(), res);
+
+			// we are not able to decode frame 2 - not enough data?
+			if (!frm2) return ISO7816Pps::ptr();
+
+			// check if the frames are equal
+			if (!frm1->Equal(frm2))
+			{
+				// remove first byte from the buffer and... fail
+				pps.erase(pps.begin());
+				return ISO7816Pps::ptr();
+			}
+			// they are the same
+			Logging::Write(std::string("PPS detected, fi: ") + Convert::ToDec(frm1->GetFi()) + std::string(", di: ") + Convert::ToDec(frm1->GetDi()));
+			int _etu = ISO7816Pps::CalculateETU(frm1->GetFi(), frm1->GetDi());
+			Logging::Write(std::string("New ETU: ") + Convert::ToDec(_etu));
+
+			if (_etu > 0)
+			{
+				exchLen = (size_t)res2;
+				ppsFound = true;
+				return frm2;
+			}
+			return ISO7816Pps::ptr();
+		}
+	}
+	return ISO7816Pps::ptr();
 }
 
 bool iso7816Analyzer::NeedsRerun()

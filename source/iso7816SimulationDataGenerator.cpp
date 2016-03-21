@@ -1,5 +1,6 @@
 //
 // Copyright © 2013 Dirk-Willem van Gulik <dirkx@webweaving.org>, all rights reserved.
+// Copyright © 2016 Adam Augustyn <adam@augustyn.net>, all rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
 //
@@ -13,6 +14,7 @@
 
 #include <AnalyzerHelpers.h>
 #include <stdlib.h>
+#include <ctime>
 
 iso7816SimulationDataGenerator::iso7816SimulationDataGenerator()
 {
@@ -26,7 +28,7 @@ void iso7816SimulationDataGenerator::Initialize( U32 simulation_sample_rate, iso
 {
 	mSimulationSampleRateHz = simulation_sample_rate;
 	mSettings = settings;
-    srand(rand() ^ time(NULL));
+    srand(rand() ^ static_cast<int>(time(NULL)));
 
 	mSerialSimulationData.SetInitialBitState( BIT_HIGH );
 }
